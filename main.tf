@@ -1,5 +1,5 @@
 # ===========================================================================
-# MAIN.TF - Two VMSS (One per Availability Zone) with Autoscaling
+# MAIN.TF - Key Vault Integration for VM Credentials
 # ===========================================================================
 
 terraform {
@@ -19,7 +19,7 @@ provider "azurerm" {
   features {
     key_vault {
       purge_soft_delete_on_destroy    = false
-      recover_soft_deleted_key_vaults = false
+      recover_soft_deleted_key_vaults = true
     }
   }
   use_oidc        = true
@@ -27,10 +27,9 @@ provider "azurerm" {
   client_id       = var.client_id
   tenant_id       = var.tenant_id
 }
-
-# ===========================================================================
+# ============================================================================
 # DATA SOURCES
-# ===========================================================================
+# ============================================================================
 
 data "azurerm_client_config" "current" {}
 
@@ -48,18 +47,18 @@ resource "random_password" "vm_admin_password" {
   min_special      = 2
 }
 
-# ============================================================================
+# ===========================================================================
 # KEY VAULT
-# ============================================================================
+# ===========================================================================
 
 resource "azurerm_key_vault" "vm_credentials" {
-  name                       = "kv-wss-lab-sec-010"
+  name                       = "kv-wss-lab-sec-100"
   location                   = var.location
   resource_group_name        = var.resource_group_name
   tenant_id                  = data.azurerm_client_config.current.tenant_id
   sku_name                   = "standard"
   soft_delete_retention_days = 7
-  rbac_authorization_enabled = true
+  rbac_authorization_enabled  = true
 
   network_acls {
     bypass         = "AzureServices"
@@ -88,7 +87,6 @@ resource "azurerm_role_assignment" "kv_certificates_officer" {
   role_definition_name = "Key Vault Certificates Officer"
   principal_id         = data.azurerm_client_config.current.object_id
 }
-
 # ============================================================================
 # KEY VAULT SECRETS
 # ============================================================================
@@ -118,7 +116,19 @@ resource "azurerm_key_vault_secret" "vm_admin_password" {
     ignore_changes = [tags]
   }
 }
+# ===========================================================================
+# KEY VAULT Certificates
+# ===========================================================================
 
+/*resource "azurerm_key_vault_certificate" "vm_mngmnt_cert" {
+  name         = "imported-cert"
+  key_vault_id = azurerm_key_vault.vm_credentials.id
+
+  certificate {
+    ontents = filebase64("certificate-to-import.pfx")
+   password = ""
+}
+}*/
 # ============================================================================
 # APPLICATION SECURITY GROUPS
 # ============================================================================
@@ -383,6 +393,7 @@ resource "azurerm_subnet_network_security_group_association" "sub_apps_nsg" {
   depends_on = [
     azurerm_subnet.sub_apps,
     azurerm_network_security_group.nsg_sub_apps,
+    # Ensure all NSG rules are created before associating
     azurerm_network_security_rule.apps_allow_rdp_from_mgmt,
     azurerm_network_security_rule.apps_allow_https_from_internet,
     azurerm_network_security_rule.apps_deny_all_from_quarantine,
@@ -397,6 +408,7 @@ resource "azurerm_subnet_network_security_group_association" "sub_mgmt_nsg" {
   depends_on = [
     azurerm_subnet.sub_mgmt,
     azurerm_network_security_group.nsg_sub_mgmt,
+    # Ensure all NSG rules are created before associating
     azurerm_network_security_rule.mgmt_allow_rdp_from_specific_ip,
     azurerm_network_security_rule.mgmt_deny_all_from_quarantine,
     azurerm_network_security_rule.mgmt_deny_all_to_quarantine
@@ -421,6 +433,7 @@ resource "azurerm_public_ip" "pip_lb" {
 # ============================================================================
 # LOAD BALANCER
 # ============================================================================
+
 resource "azurerm_lb" "lb" {
   name                = "lbi-wss-lab-sec-001"
   location            = var.location
@@ -476,7 +489,7 @@ resource "azurerm_lb_outbound_rule" "out_lb" {
   loadbalancer_id          = azurerm_lb.lb.id
   protocol                 = "All"
   backend_address_pool_id  = azurerm_lb_backend_address_pool.pool_webs.id
-  allocated_outbound_ports = 15992
+  allocated_outbound_ports = 31992
   idle_timeout_in_minutes  = 4
 
   frontend_ip_configuration {
@@ -489,10 +502,9 @@ resource "azurerm_lb_outbound_rule" "out_lb" {
   ]
 }
 
-
-# ============================================================================
-# MANAGEMENT VM (Single VM)
-# ============================================================================
+# ==========================================================================
+# NETWORK INTERFACES
+# ==========================================================================
 
 resource "azurerm_network_interface" "nic_mgmt" {
   name                = "nic-vm-mgmt-wss-lab-sec-001"
@@ -510,6 +522,42 @@ resource "azurerm_network_interface" "nic_mgmt" {
   depends_on = [azurerm_subnet.sub_mgmt]
 }
 
+resource "azurerm_network_interface" "nic_web1" {
+  name                = "nic-vm-web1-wss-lab-sec-001"
+  location            = var.location
+  resource_group_name = var.resource_group_name
+
+  ip_configuration {
+    name                          = "ipconfig1"
+    subnet_id                     = azurerm_subnet.sub_apps.id
+    private_ip_address_allocation = "Dynamic"
+    private_ip_address_version    = "IPv4"
+    primary                       = true
+  }
+
+  depends_on = [azurerm_subnet.sub_apps]
+}
+
+resource "azurerm_network_interface" "nic_web2" {
+  name                = "nic-vm-web2-wss-lab-sec-001"
+  location            = var.location
+  resource_group_name = var.resource_group_name
+
+  ip_configuration {
+    name                          = "ipconfig1"
+    subnet_id                     = azurerm_subnet.sub_apps.id
+    private_ip_address_allocation = "Dynamic"
+    private_ip_address_version    = "IPv4"
+    primary                       = true
+  }
+
+  depends_on = [azurerm_subnet.sub_apps]
+}
+
+# ============================================================================
+# NIC TO ASG ASSOCIATIONS
+# ============================================================================
+
 resource "azurerm_network_interface_application_security_group_association" "nic_mgmt_asg" {
   network_interface_id          = azurerm_network_interface.nic_mgmt.id
   application_security_group_id = azurerm_application_security_group.asg_mgmt_tier.id
@@ -519,6 +567,76 @@ resource "azurerm_network_interface_application_security_group_association" "nic
     azurerm_application_security_group.asg_mgmt_tier
   ]
 }
+
+resource "azurerm_network_interface_application_security_group_association" "nic_web1_asg_web_tier" {
+  network_interface_id          = azurerm_network_interface.nic_web1.id
+  application_security_group_id = azurerm_application_security_group.asg_web_tier.id
+
+  depends_on = [
+    azurerm_network_interface.nic_web1,
+    azurerm_application_security_group.asg_web_tier
+  ]
+}
+
+resource "azurerm_network_interface_application_security_group_association" "nic_web1_asg_lb_backend" {
+  network_interface_id          = azurerm_network_interface.nic_web1.id
+  application_security_group_id = azurerm_application_security_group.asg_lb_backend.id
+
+  depends_on = [
+    azurerm_network_interface.nic_web1,
+    azurerm_application_security_group.asg_lb_backend
+  ]
+}
+
+resource "azurerm_network_interface_application_security_group_association" "nic_web2_asg_web_tier" {
+  network_interface_id          = azurerm_network_interface.nic_web2.id
+  application_security_group_id = azurerm_application_security_group.asg_web_tier.id
+
+  depends_on = [
+    azurerm_network_interface.nic_web2,
+    azurerm_application_security_group.asg_web_tier
+  ]
+}
+
+resource "azurerm_network_interface_application_security_group_association" "nic_web2_asg_lb_backend" {
+  network_interface_id          = azurerm_network_interface.nic_web2.id
+  application_security_group_id = azurerm_application_security_group.asg_lb_backend.id
+
+  depends_on = [
+    azurerm_network_interface.nic_web2,
+    azurerm_application_security_group.asg_lb_backend
+  ]
+}
+
+# ============================================================================
+# NIC BACKEND POOL ASSOCIATIONS
+# ============================================================================
+
+resource "azurerm_network_interface_backend_address_pool_association" "nic_web1_lb" {
+  network_interface_id    = azurerm_network_interface.nic_web1.id
+  ip_configuration_name   = "ipconfig1"
+  backend_address_pool_id = azurerm_lb_backend_address_pool.pool_webs.id
+
+  depends_on = [
+    azurerm_network_interface.nic_web1,
+    azurerm_lb_backend_address_pool.pool_webs
+  ]
+}
+
+resource "azurerm_network_interface_backend_address_pool_association" "nic_web2_lb" {
+  network_interface_id    = azurerm_network_interface.nic_web2.id
+  ip_configuration_name   = "ipconfig1"
+  backend_address_pool_id = azurerm_lb_backend_address_pool.pool_webs.id
+
+  depends_on = [
+    azurerm_network_interface.nic_web2,
+    azurerm_lb_backend_address_pool.pool_webs
+  ]
+}
+
+# ============================================================================
+# VIRTUAL MACHINES
+# ============================================================================
 
 resource "azurerm_windows_virtual_machine" "vm_mgmt" {
   name                  = "vm-mgmt-wss-sec"
@@ -551,24 +669,14 @@ resource "azurerm_windows_virtual_machine" "vm_mgmt" {
   ]
 }
 
-# ============================================================================
-# VMSS - ZONE 1
-# ============================================================================
-
-resource "azurerm_windows_virtual_machine_scale_set" "vmss_web_zone1" {
-  name                = "vmss-app1"
-  location            = var.location
-  resource_group_name = var.resource_group_name
-  sku                 = "Standard_D2as_v5"
-  instances           = 1
-  admin_username      = azurerm_key_vault_secret.vm_admin_username.value
-  admin_password      = azurerm_key_vault_secret.vm_admin_password.value
-
-  zones        = ["1"]
-  zone_balance = false
-
-  upgrade_mode    = "Automatic"
-  health_probe_id = azurerm_lb_probe.hp_lb.id
+resource "azurerm_windows_virtual_machine" "vm_web1" {
+  name                  = "vm-web1-wss-sec"
+  location              = var.location
+  resource_group_name   = var.resource_group_name
+  size                  = "Standard_D2as_v5"
+  admin_username        = azurerm_key_vault_secret.vm_admin_username.value
+  admin_password        = azurerm_key_vault_secret.vm_admin_password.value
+  network_interface_ids = [azurerm_network_interface.nic_web1.id]
 
   source_image_reference {
     publisher = "MicrosoftWindowsServer"
@@ -580,64 +688,26 @@ resource "azurerm_windows_virtual_machine_scale_set" "vmss_web_zone1" {
   os_disk {
     caching              = "ReadWrite"
     storage_account_type = "Standard_LRS"
+    name                 = "osdisk-vm-web1-wss-lab-sec-001"
   }
 
-  network_interface {
-    name    = "nic-vmss-zone1"
-    primary = true
-
-    ip_configuration {
-      name                                   = "internal"
-      primary                                = true
-      subnet_id                              = azurerm_subnet.sub_apps.id
-      load_balancer_backend_address_pool_ids = [azurerm_lb_backend_address_pool.pool_webs.id]
-
-      application_security_group_ids = [
-        azurerm_application_security_group.asg_web_tier.id,
-        azurerm_application_security_group.asg_lb_backend.id
-      ]
-    }
-  }
-
-  automatic_instance_repair {
-    enabled      = true
-    grace_period = "PT30M"
-  }
-
-  tags = {
-    Environment = "Lab"
-    Zone        = "1"
-    Tier        = "Web"
-  }
+  secure_boot_enabled = true
+  vtpm_enabled        = true
 
   depends_on = [
-    azurerm_subnet.sub_apps,
-    azurerm_lb_backend_address_pool.pool_webs,
-    azurerm_lb_probe.hp_lb,
-    azurerm_application_security_group.asg_web_tier,
-    azurerm_application_security_group.asg_lb_backend,
+    azurerm_network_interface.nic_web1,
     azurerm_key_vault_secret.vm_admin_password
   ]
 }
 
-# ============================================================================
-# VMSS - ZONE 2
-# ============================================================================
-
-resource "azurerm_windows_virtual_machine_scale_set" "vmss_web_zone2" {
-  name                = "vmss-app2"
-  location            = var.location
-  resource_group_name = var.resource_group_name
-  sku                 = "Standard_D2as_v5"
-  instances           = 1
-  admin_username      = azurerm_key_vault_secret.vm_admin_username.value
-  admin_password      = azurerm_key_vault_secret.vm_admin_password.value
-
-  zones        = ["2"]
-  zone_balance = false
-
-  upgrade_mode    = "Automatic"
-  health_probe_id = azurerm_lb_probe.hp_lb.id
+resource "azurerm_windows_virtual_machine" "vm_web2" {
+  name                  = "vm-web2-wss-sec"
+  location              = var.location
+  resource_group_name   = var.resource_group_name
+  size                  = "Standard_D2as_v5"
+  admin_username        = azurerm_key_vault_secret.vm_admin_username.value
+  admin_password        = azurerm_key_vault_secret.vm_admin_password.value
+  network_interface_ids = [azurerm_network_interface.nic_web2.id]
 
   source_image_reference {
     publisher = "MicrosoftWindowsServer"
@@ -649,290 +719,16 @@ resource "azurerm_windows_virtual_machine_scale_set" "vmss_web_zone2" {
   os_disk {
     caching              = "ReadWrite"
     storage_account_type = "Standard_LRS"
+    name                 = "osdisk-vm-web2-wss-lab-sec-001"
   }
 
-  network_interface {
-    name    = "nic-vmss-zone2"
-    primary = true
-
-    ip_configuration {
-      name                                   = "internal"
-      primary                                = true
-      subnet_id                              = azurerm_subnet.sub_apps.id
-      load_balancer_backend_address_pool_ids = [azurerm_lb_backend_address_pool.pool_webs.id]
-
-      application_security_group_ids = [
-        azurerm_application_security_group.asg_web_tier.id,
-        azurerm_application_security_group.asg_lb_backend.id
-      ]
-    }
-  }
-
-  automatic_instance_repair {
-    enabled      = true
-    grace_period = "PT30M"
-  }
-
-  tags = {
-    Environment = "Lab"
-    Zone        = "2"
-    Tier        = "Web"
-  }
+  secure_boot_enabled = true
+  vtpm_enabled        = true
 
   depends_on = [
-    azurerm_subnet.sub_apps,
-    azurerm_lb_backend_address_pool.pool_webs,
-    azurerm_lb_probe.hp_lb,
-    azurerm_application_security_group.asg_web_tier,
-    azurerm_application_security_group.asg_lb_backend,
+    azurerm_network_interface.nic_web2,
     azurerm_key_vault_secret.vm_admin_password
   ]
-}
-
-# ============================================================================
-# AUTOSCALE SETTINGS - ZONE 1
-# ============================================================================
-
-resource "azurerm_monitor_autoscale_setting" "vmss_zone1_autoscale" {
-  name                = "autoscale-vmss-zone1"
-  resource_group_name = var.resource_group_name
-  location            = var.location
-  target_resource_id  = azurerm_windows_virtual_machine_scale_set.vmss_web_zone1.id
-
-  profile {
-    name = "defaultProfile"
-
-    capacity {
-      default = 1
-      minimum = 1
-      maximum = 5
-    }
-
-    # Scale OUT when CPU > 75%
-    rule {
-      metric_trigger {
-        metric_name        = "Percentage CPU"
-        metric_resource_id = azurerm_windows_virtual_machine_scale_set.vmss_web_zone1.id
-        time_grain         = "PT1M"
-        statistic          = "Average"
-        time_window        = "PT5M"
-        time_aggregation   = "Average"
-        operator           = "GreaterThan"
-        threshold          = 75
-      }
-
-      scale_action {
-        direction = "Increase"
-        type      = "ChangeCount"
-        value     = "1"
-        cooldown  = "PT5M"
-      }
-    }
-
-    # Scale IN when CPU < 25%
-    rule {
-      metric_trigger {
-        metric_name        = "Percentage CPU"
-        metric_resource_id = azurerm_windows_virtual_machine_scale_set.vmss_web_zone1.id
-        time_grain         = "PT1M"
-        statistic          = "Average"
-        time_window        = "PT10M"
-        time_aggregation   = "Average"
-        operator           = "LessThan"
-        threshold          = 25
-      }
-
-      scale_action {
-        direction = "Decrease"
-        type      = "ChangeCount"
-        value     = "1"
-        cooldown  = "PT10M"
-      }
-    }
-
-    # Scale OUT when Memory > 80%
-    rule {
-      metric_trigger {
-        metric_name        = "Available Memory Bytes"
-        metric_resource_id = azurerm_windows_virtual_machine_scale_set.vmss_web_zone1.id
-        time_grain         = "PT1M"
-        statistic          = "Average"
-        time_window        = "PT5M"
-        time_aggregation   = "Average"
-        operator           = "LessThan"
-        threshold          = 1073741824 # 1GB in bytes
-      }
-
-      scale_action {
-        direction = "Increase"
-        type      = "ChangeCount"
-        value     = "1"
-        cooldown  = "PT5M"
-      }
-    }
-  }
-
-  # Schedule-based scaling for business hours
-  profile {
-    name = "businessHoursProfile"
-
-    capacity {
-      default = 1
-      minimum = 1
-      maximum = 5
-    }
-
-    recurrence {
-      timezone = "Central European Standard Time"
-      days     = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
-      hours    = [8]
-      minutes  = [0]
-    }
-  }
-
-  # Scale back after business hours
-  profile {
-    name = "afterHoursProfile"
-
-    capacity {
-      default = 1
-      minimum = 1
-      maximum = 3
-    }
-
-    recurrence {
-      timezone = "Central European Standard Time"
-      days     = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
-      hours    = [18]
-      minutes  = [0]
-    }
-  }
-
-
-  depends_on = [azurerm_windows_virtual_machine_scale_set.vmss_web_zone1]
-}
-
-# ===========================================================================
-# AUTOSCALE SETTINGS - ZONE 2v
-# ===========================================================================
-
-resource "azurerm_monitor_autoscale_setting" "vmss_zone2_autoscale" {
-  name                = "autoscale-vmss-zone2"
-  resource_group_name = var.resource_group_name
-  location            = var.location
-  target_resource_id  = azurerm_windows_virtual_machine_scale_set.vmss_web_zone2.id
-
-  profile {
-    name = "defaultProfile"
-
-    capacity {
-      default = 1
-      minimum = 1
-      maximum = 5
-    }
-
-    # Scale OUT when CPU > 75%
-    rule {
-      metric_trigger {
-        metric_name        = "Percentage CPU"
-        metric_resource_id = azurerm_windows_virtual_machine_scale_set.vmss_web_zone2.id
-        time_grain         = "PT1M"
-        statistic          = "Average"
-        time_window        = "PT5M"
-        time_aggregation   = "Average"
-        operator           = "GreaterThan"
-        threshold          = 75
-      }
-
-      scale_action {
-        direction = "Increase"
-        type      = "ChangeCount"
-        value     = "1"
-        cooldown  = "PT5M"
-      }
-    }
-
-    # Scale IN when CPU < 25%
-    rule {
-      metric_trigger {
-        metric_name        = "Percentage CPU"
-        metric_resource_id = azurerm_windows_virtual_machine_scale_set.vmss_web_zone2.id
-        time_grain         = "PT1M"
-        statistic          = "Average"
-        time_window        = "PT10M"
-        time_aggregation   = "Average"
-        operator           = "LessThan"
-        threshold          = 25
-      }
-
-      scale_action {
-        direction = "Decrease"
-        type      = "ChangeCount"
-        value     = "1"
-        cooldown  = "PT10M"
-      }
-    }
-
-    # Scale OUT when Memory > 80%
-    rule {
-      metric_trigger {
-        metric_name        = "Available Memory Bytes"
-        metric_resource_id = azurerm_windows_virtual_machine_scale_set.vmss_web_zone2.id
-        time_grain         = "PT1M"
-        statistic          = "Average"
-        time_window        = "PT5M"
-        time_aggregation   = "Average"
-        operator           = "LessThan"
-        threshold          = 1073741824 # 1GB in bytes
-      }
-
-      scale_action {
-        direction = "Increase"
-        type      = "ChangeCount"
-        value     = "1"
-        cooldown  = "PT5M"
-      }
-    }
-  }
-
-  # Schedule-based scaling for business hours
-  profile {
-    name = "businessHoursProfile"
-
-    capacity {
-      default = 1
-      minimum = 1
-      maximum = 5
-    }
-
-    recurrence {
-      timezone = "Central European Standard Time"
-      days     = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
-      hours    = [8]
-      minutes  = [0]
-    }
-  }
-
-  # Scale back after business hours
-  profile {
-    name = "afterHoursProfile"
-
-    capacity {
-      default = 1
-      minimum = 1
-      maximum = 3
-    }
-
-    recurrence {
-      timezone = "Central European Standard Time"
-      days     = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
-      hours    = [18]
-      minutes  = [0]
-    }
-  }
-
-
-  depends_on = [azurerm_windows_virtual_machine_scale_set.vmss_web_zone2]
 }
 
 # ============================================================================
@@ -952,7 +748,7 @@ resource "azurerm_recovery_services_vault" "rsv" {
 # ============================================================================
 
 resource "azurerm_log_analytics_workspace" "law" {
-  name                = "log-wss-lab-sec-010"
+  name                = "log-wss-lab-sec-001"
   location            = var.location
   resource_group_name = var.resource_group_name
   sku                 = "PerGB2018"
@@ -960,102 +756,18 @@ resource "azurerm_log_analytics_workspace" "law" {
 }
 
 # ============================================================================
-# STORAGE ACCOUNT FOR LOG EXPORT
+# STORAGE ACCOUNTS
 # ============================================================================
 
 resource "azurerm_storage_account" "stblc" {
-  name                     = "stblcwsslabsec001"
+  name                     = "stblcwsslabsec100"
   resource_group_name      = var.resource_group_name
   location                 = var.location
   account_tier             = "Standard"
   account_replication_type = "LRS"
-  access_tier              = "Hot"
 
   min_tls_version                 = "TLS1_2"
   allow_nested_items_to_be_public = false
-}
-
-# ============================================================================
-# STORAGE CONTAINERS
-# ============================================================================
-
-resource "azurerm_storage_container" "insights_logs_activity" {
-  name                  = "insights-logs-activity"
-  storage_account_id    = azurerm_storage_account.stblc.id
-  container_access_type = "private"
-}
-
-resource "azurerm_storage_container" "insights_logs_security" {
-  name                  = "insights-logs-security"
-  storage_account_id    = azurerm_storage_account.stblc.id
-  container_access_type = "private"
-}
-
-resource "azurerm_storage_container" "insights_logs_resource" {
-  name                  = "insights-logs-resource"
-  storage_account_id    = azurerm_storage_account.stblc.id
-  container_access_type = "private"
-}
-
-resource "azurerm_storage_container" "insights_logs_networking" {
-  name                  = "insights-logs-networking"
-  storage_account_id    = azurerm_storage_account.stblc.id
-  container_access_type = "private"
-}
-
-resource "azurerm_storage_container" "insights_logs_app" {
-  name                  = "insights-logs-app"
-  storage_account_id    = azurerm_storage_account.stblc.id
-  container_access_type = "private"
-}
-
-# ============================================================================
-# LIFECYCLE MANAGEMENT POLICY
-# ============================================================================
-
-resource "azurerm_storage_management_policy" "lifecycle" {
-  storage_account_id = azurerm_storage_account.stblc.id
-
-  rule {
-    name    = "log-lifecycle"
-    enabled = true
-
-    filters {
-      prefix_match = ["insights-logs/"]
-      blob_types   = ["blockBlob"]
-    }
-
-    actions {
-      base_blob {
-        tier_to_cool_after_days_since_modification_greater_than    = 30
-        tier_to_archive_after_days_since_modification_greater_than = 180
-      }
-    }
-  }
-}
-
-# ============================================================================
-# LINKED STORAGE ACCOUNT
-# ============================================================================
-
-resource "azurerm_log_analytics_linked_storage_account" "law_storage" {
-  data_source_type      = "CustomLogs"
-  resource_group_name   = var.resource_group_name
-  workspace_resource_id = azurerm_log_analytics_workspace.law.id
-  storage_account_ids   = [azurerm_storage_account.stblc.id]
-}
-
-# ============================================================================
-# DATA EXPORT RULES
-# ============================================================================
-
-resource "azurerm_log_analytics_data_export_rule" "export_all" {
-  name                    = "export-all-tables"
-  resource_group_name     = var.resource_group_name
-  workspace_resource_id   = azurerm_log_analytics_workspace.law.id
-  destination_resource_id = azurerm_storage_account.stblc.id
-  table_names             = ["*"]
-  enabled                 = true
 }
 
 # ============================================================================
@@ -1090,6 +802,46 @@ resource "azurerm_private_dns_a_record" "dns_vm_mgmt" {
   resource_group_name = var.resource_group_name
   ttl                 = 10
   records             = ["10.100.0.4"]
+
+  depends_on = [azurerm_private_dns_zone.dns_zone]
+}
+
+resource "azurerm_private_dns_a_record" "dns_vm_web1" {
+  name                = "vm-web1-demo-sw"
+  zone_name           = azurerm_private_dns_zone.dns_zone.name
+  resource_group_name = var.resource_group_name
+  ttl                 = 10
+  records             = ["10.100.1.4"]
+
+  depends_on = [azurerm_private_dns_zone.dns_zone]
+}
+
+resource "azurerm_private_dns_a_record" "dns_vm_web2" {
+  name                = "vm-web2-demo-sw"
+  zone_name           = azurerm_private_dns_zone.dns_zone.name
+  resource_group_name = var.resource_group_name
+  ttl                 = 10
+  records             = ["10.100.1.5"]
+
+  depends_on = [azurerm_private_dns_zone.dns_zone]
+}
+
+resource "azurerm_private_dns_a_record" "dns_web1" {
+  name                = "web1"
+  zone_name           = azurerm_private_dns_zone.dns_zone.name
+  resource_group_name = var.resource_group_name
+  ttl                 = 3600
+  records             = ["10.100.1.4"]
+
+  depends_on = [azurerm_private_dns_zone.dns_zone]
+}
+
+resource "azurerm_private_dns_a_record" "dns_web2" {
+  name                = "web2"
+  zone_name           = azurerm_private_dns_zone.dns_zone.name
+  resource_group_name = var.resource_group_name
+  ttl                 = 3600
+  records             = ["10.100.1.5"]
 
   depends_on = [azurerm_private_dns_zone.dns_zone]
 }
