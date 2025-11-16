@@ -1,0 +1,215 @@
+name: 'Terraform Import Resources'
+
+on:
+  workflow_dispatch:
+    inputs:
+      state_file_key:
+        description: 'State file name (without .tfstate)'
+        required: false
+        default: 'loadbalancer.prod'
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  terraform-import:
+    name: 'Import Existing Resources'
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_wrapper: false
+        
+      - name: Terraform Init
+        env:
+          ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          ARM_USE_OIDC: true
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ vars.BACKEND_RESOURCE_GROUP_NAME }}" \
+            -backend-config="storage_account_name=${{ vars.BACKEND_STORAGE_ACCOUNT_NAME }}" \
+            -backend-config="container_name=${{ vars.BACKEND_CONTAINER_NAME }}" \
+            -backend-config="key=${{ github.event.inputs.state_file_key }}.tfstate" \
+            -backend-config="use_oidc=true"
+
+      - name: Check Current State
+        env:
+          ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          ARM_USE_OIDC: true
+        run: |
+          echo "============================================"
+          echo "📋 Current Resources in State"
+          echo "============================================"
+          terraform state list || echo "State is empty or error occurred"
+          echo "============================================"
+          echo ""
+
+      - name: Import Resources
+        env:
+          ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          ARM_USE_OIDC: true
+          TF_VAR_subscription_id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          TF_VAR_client_id: ${{ secrets.AZURE_CLIENT_ID }}
+          TF_VAR_tenant_id: ${{ secrets.AZURE_TENANT_ID }}
+        run: |
+          echo "============================================"
+          echo "🔄 Starting Terraform Import Process"
+          echo "============================================"
+          echo ""
+          
+          # Track statistics
+          IMPORTED=0
+          ALREADY_IMPORTED=0
+          FAILED=0
+          SKIPPED=0
+          
+          # Function to check if resource is already in state
+          resource_in_state() {
+            terraform state list | grep -q "^$1$"
+          }
+          
+          # Function to import a resource
+          import_resource() {
+            local resource=$1
+            local id=$2
+            local description=$3
+            
+            echo "────────────────────────────────────────"
+            echo "📦 $description"
+            echo "   Resource: $resource"
+            echo "   ID: $id"
+            echo ""
+            
+            # Check if already in state
+            if resource_in_state "$resource"; then
+              echo "⏭️  Already in state - skipping"
+              ALREADY_IMPORTED=$((ALREADY_IMPORTED + 1))
+              echo ""
+              return 0
+            fi
+            
+            # Try to import
+            if terraform import "$resource" "$id" 2>&1 | tee /tmp/import_output.txt; then
+              echo "✅ Successfully imported"
+              IMPORTED=$((IMPORTED + 1))
+            else
+              if grep -q "Resource already managed by Terraform" /tmp/import_output.txt; then
+                echo "⚠️  Already imported (detected from error)"
+                ALREADY_IMPORTED=$((ALREADY_IMPORTED + 1))
+              else
+                echo "❌ Import failed"
+                cat /tmp/import_output.txt
+                FAILED=$((FAILED + 1))
+              fi
+            fi
+            echo ""
+          }
+          
+          # Get Key Vault secret versions using Azure CLI
+          echo "🔍 Fetching Key Vault secret versions..."
+          
+          USERNAME_VERSION=$(az keyvault secret show \
+            --vault-name kv-wss-lab-sec-001 \
+            --name vm-admin-username \
+            --query 'id' -o tsv 2>/dev/null | grep -oP '/[^/]+$' | tr -d '/')
+          
+          PASSWORD_VERSION=$(az keyvault secret show \
+            --vault-name kv-wss-lab-sec-001 \
+            --name vm-admin-password \
+            --query 'id' -o tsv 2>/dev/null | grep -oP '/[^/]+$' | tr -d '/')
+          
+          echo "   Username secret version: $USERNAME_VERSION"
+          echo "   Password secret version: $PASSWORD_VERSION"
+          echo ""
+          
+          # Import Key Vault Secrets with versions
+          if [ -n "$USERNAME_VERSION" ]; then
+            import_resource \
+              "azurerm_key_vault_secret.vm_admin_username" \
+              "https://kv-wss-lab-sec-001.vault.azure.net/secrets/vm-admin-username/$USERNAME_VERSION" \
+              "Import Key Vault admin username secret"
+          else
+            echo "⚠️  Could not fetch username secret version - skipping"
+            SKIPPED=$((SKIPPED + 1))
+            echo ""
+          fi
+          
+          if [ -n "$PASSWORD_VERSION" ]; then
+            import_resource \
+              "azurerm_key_vault_secret.vm_admin_password" \
+              "https://kv-wss-lab-sec-001.vault.azure.net/secrets/vm-admin-password/$PASSWORD_VERSION" \
+              "Import Key Vault admin password secret"
+          else
+            echo "⚠️  Could not fetch password secret version - skipping"
+            SKIPPED=$((SKIPPED + 1))
+            echo ""
+          fi
+          
+          # Import Log Analytics Linked Storage Account
+          import_resource \
+            "azurerm_log_analytics_linked_storage_account.law_storage" \
+            "/subscriptions/${{ secrets.AZURE_SUBSCRIPTION_ID }}/resourceGroups/rg-kolad-sch/providers/Microsoft.OperationalInsights/workspaces/log-wss-lab-sec-001/linkedStorageAccounts/CustomLogs" \
+            "Import Log Analytics linked storage account"
+          
+          # Import Log Analytics Data Export Rule
+          import_resource \
+            "azurerm_log_analytics_data_export_rule.export_all" \
+            "/subscriptions/${{ secrets.AZURE_SUBSCRIPTION_ID }}/resourceGroups/rg-kolad-sch/providers/Microsoft.OperationalInsights/workspaces/log-wss-lab-sec-001/dataExports/export-all-tables" \
+            "Import Log Analytics data export rule"
+          
+          # Print summary
+          echo "============================================"
+          echo "📈 Import Results"
+          echo "============================================"
+          echo "✅ Successfully imported: $IMPORTED"
+          echo "⏭️  Already in state: $ALREADY_IMPORTED"
+          echo "⚠️  Skipped: $SKIPPED"
+          echo "❌ Failed: $FAILED"
+          echo "============================================"
+          echo ""
+          
+          if [ $IMPORTED -gt 0 ]; then
+            echo "✨ Next steps:"
+            echo "1. Run 'terraform plan' to verify the imported resources"
+            echo "2. Adjust your Terraform configuration if there are differences"
+            echo "3. Run 'terraform apply' when ready"
+          elif [ $ALREADY_IMPORTED -gt 0 ]; then
+            echo "✓ All resources are already in state!"
+            echo "  You can proceed with 'terraform plan' and 'terraform apply'"
+          fi
+          echo "============================================"
+
+      - name: Verify State After Import
+        if: success()
+        env:
+          ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          ARM_USE_OIDC: true
+        run: |
+          echo "============================================"
+          echo "📋 Updated State Resources"
+          echo "============================================"
+          terraform state list
+          echo "============================================"

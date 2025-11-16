@@ -1,0 +1,177 @@
+name: 'Terraform Destroy'
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to destroy'
+        required: true
+        type: choice
+        options:
+          - production
+          - staging
+          - development
+      confirmation:
+        description: 'Type "DESTROY" to confirm destruction'
+        required: true
+        type: string
+      destroy_target:
+        description: 'Specific resource to destroy (optional, leave empty for all)'
+        required: false
+        type: string
+      state_file_key:
+        description: 'State file name (without .tfstate)'
+        required: false
+        default: 'loadbalancer.prod'
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  validate-destroy:
+    name: 'Validate Destroy Request'
+    runs-on: ubuntu-latest
+    outputs:
+      approved: ${{ steps.check.outputs.approved }}
+    
+    steps:
+      - name: Check Confirmation
+        id: check
+        run: |
+          if [ "${{ github.event.inputs.confirmation }}" != "DESTROY" ]; then
+            echo "❌ Confirmation failed. You must type 'DESTROY' exactly to proceed."
+            exit 1
+          fi
+          echo "✅ Confirmation validated"
+          echo "approved=true" >> $GITHUB_OUTPUT
+
+      - name: Display Destroy Information
+        run: |
+          echo "⚠️  DESTROY OPERATION REQUESTED ⚠️"
+          echo "=================================="
+          echo "Environment: ${{ github.event.inputs.environment }}"
+          echo "Requested by: ${{ github.actor }}"
+          echo "State file: ${{ github.event.inputs.state_file_key }}.tfstate"
+          if [ -n "${{ github.event.inputs.destroy_target }}" ]; then
+            echo "Target resource: ${{ github.event.inputs.destroy_target }}"
+          else
+            echo "Target: ALL RESOURCES"
+          fi
+          echo "=================================="
+
+  terraform-destroy:
+    name: 'Terraform Destroy'
+    runs-on: ubuntu-latest
+    needs: validate-destroy
+    environment: ${{ github.event.inputs.environment }}
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        
+      - name: Terraform Init
+        id: init
+        env:
+          ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          ARM_USE_OIDC: true
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ vars.BACKEND_RESOURCE_GROUP_NAME }}" \
+            -backend-config="storage_account_name=${{ vars.BACKEND_STORAGE_ACCOUNT_NAME }}" \
+            -backend-config="container_name=${{ vars.BACKEND_CONTAINER_NAME }}" \
+            -backend-config="key=${{ github.event.inputs.state_file_key }}.tfstate" \
+            -backend-config="use_oidc=true"
+
+      - name: Terraform Destroy Plan
+        id: destroy-plan
+        env:
+          ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          ARM_USE_OIDC: true
+          TF_VAR_subscription_id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          TF_VAR_client_id: ${{ secrets.AZURE_CLIENT_ID }}
+          TF_VAR_tenant_id: ${{ secrets.AZURE_TENANT_ID }}
+        run: |
+          echo "🔍 Generating destroy plan..."
+          if [ -n "${{ github.event.inputs.destroy_target }}" ]; then
+            terraform plan -destroy -target="${{ github.event.inputs.destroy_target }}" -out=destroy.tfplan
+          else
+            terraform plan -destroy -out=destroy.tfplan
+          fi
+
+      - name: Display Destroy Plan
+        run: |
+          echo "📋 Resources that will be DESTROYED:"
+          echo "===================================="
+          terraform show destroy.tfplan
+          echo "===================================="
+
+      - name: Wait Before Destroy
+        run: |
+          echo "⏳ Waiting 10 seconds before proceeding with destruction..."
+          echo "   This is your last chance to cancel (Ctrl+C in the Actions UI)"
+          sleep 10
+          echo "⚠️  Proceeding with destroy operation..."
+
+      - name: Terraform Destroy
+        id: destroy
+        env:
+          ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          ARM_USE_OIDC: true
+          TF_VAR_subscription_id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          TF_VAR_client_id: ${{ secrets.AZURE_CLIENT_ID }}
+          TF_VAR_tenant_id: ${{ secrets.AZURE_TENANT_ID }}
+        run: |
+          if [ -n "${{ github.event.inputs.destroy_target }}" ]; then
+            terraform apply -auto-approve destroy.tfplan
+            echo "✅ Destroyed target resource: ${{ github.event.inputs.destroy_target }}"
+          else
+            terraform apply -auto-approve destroy.tfplan
+            echo "✅ Destroyed all resources"
+          fi
+
+      - name: Destroy Summary
+        if: always()
+        run: |
+          echo "============================================"
+          if [ "${{ steps.destroy.outcome }}" == "success" ]; then
+            echo "💥 DESTRUCTION COMPLETE"
+            echo "============================================"
+            echo "Environment: ${{ github.event.inputs.environment }}"
+            echo "Destroyed by: ${{ github.actor }}"
+            echo "Timestamp: $(date -u +"%Y-%m-%d %H:%M:%S UTC")"
+            if [ -n "${{ github.event.inputs.destroy_target }}" ]; then
+              echo "Resource: ${{ github.event.inputs.destroy_target }}"
+            else
+              echo "Scope: ALL RESOURCES"
+            fi
+          else
+            echo "❌ DESTRUCTION FAILED"
+            echo "============================================"
+            echo "Check the logs above for error details"
+          fi
+          echo "============================================"
+
+      - name: Post-Destroy Notification
+        if: success()
+        run: |
+          echo "🔔 IMPORTANT: Verify in Azure Portal that resources were destroyed"
+          echo "   Environment: ${{ github.event.inputs.environment }}"
+          echo "   State file: ${{ github.event.inputs.state_file_key }}.tfstate"

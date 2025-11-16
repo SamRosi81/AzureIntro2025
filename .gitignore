@@ -1,0 +1,67 @@
+# Terraform - local directories
+.terraform/
+GEMINI.md
+# Terraform state files and backups (may contain secrets)
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+crash.log
+
+# Terraform CLI config
+.terraformrc
+terraform.rc
+
+# Variable files (often contain secrets) - do NOT commit these
+*.tfvars
+*.tfvars.json
+terraform.tfvars
+
+# Terraform plan output and binary plans
+*.tfplan
+*.plan
+
+# Lock file (can be committed, but often ignored for private modules)
+.terraform.lock.hcl
+
+# Override files
+override.tf
+override.tf.json
+*_override.tf
+
+# Terraform lock info (local locking file)
+.terraform.tfstate.lock.info
+
+# Sensitive keys and certificates
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.der
+
+# OS generated files
+Thumbs.db
+.DS_Store
+
+# Editors and IDEs
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+
+# Language/runtime caches
+__pycache__/
+node_modules/
+
+# Optional: backup and temp files
+*~
+*.swp
+*.bak
